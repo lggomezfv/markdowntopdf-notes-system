@@ -1,0 +1,11 @@
+# Python dependencies for markdown to PDF conversion
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+playwright>=1.40.0
+plantuml>=0.3.0
+colorama>=0.4.6
+
+# External dependencies (install separately):
+# - Pandoc: https://pandoc.org/installing.html
+# - Playwright browsers: playwright install chromium
