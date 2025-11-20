@@ -74,6 +74,9 @@ poetry run md2ebook --format mobi --source ./manuscript --output-dir ./publish -
 
 # Maintenance: Clear cache and regenerate all
 poetry run md2pdf --cleanup-db && poetry run md2pdf --source ./docs
+
+# Force regeneration without clearing database (e.g., after code updates)
+poetry run md2pdf --force --source ./docs
 ```
 
 ### Common Options
@@ -86,6 +89,7 @@ poetry run md2pdf --cleanup-db && poetry run md2pdf --source ./docs
 - `--margins "TOP RIGHT BOTTOM LEFT"` - Page margins (default: `"1in 0.75in"`)
 - `--max-workers NUM` - Parallel workers (default: `4`)
 - `--no-parallel` - Disable parallel processing
+- `--force` - Force regeneration of all files, bypassing document verification cache
 - `--debug` - Enable debug logging
 - `--no-cleanup` - Keep temporary files
 - `--cleanup-db` - Clear verification database and recreate with current schema
@@ -99,11 +103,12 @@ poetry run md2pdf --cleanup-db && poetry run md2pdf --source ./docs
 
 ## Features
 
-- Renders Mermaid and PlantUML diagrams as images
+- Renders Mermaid and PlantUML diagrams as images with **intelligent rendering** (dimension stability detection)
 - **Configurable diagram dimensions** with automatic resizing
 - **Per-diagram resize control** with `<!-- no-resize -->`, `<!-- upscale:X% -->`, and `<!-- downscale:X% -->` modifiers
 - **Automatic page numbering** in PDF footer (centered)
-- Smart verification (skips unchanged files)
+- **Smart verification** (skips unchanged files) with optional bypass via `--force`
+- **Parallel processing** for fast batch conversions
 - Style profiles: `a4-print` (12px) or `a4-screen` (15.6px)
 - Page breaks: `<!-- page-break -->` or `<div class="page-break"></div>`
 - Output: `output/pdf/`, `output/epub/`, `output/mobi/`
@@ -220,11 +225,15 @@ ls -la ./temp/
    poetry run playwright install chromium
    ```
 
-2. **Cache issues or after updates**: Clear and recreate the verification database
+2. **Cache issues or after updates**: Force regeneration or clear verification database
    ```bash
+   # Quick: Force regeneration (keeps verification data)
+   poetry run md2pdf --force --source ./docs
+   
+   # Full reset: Clear and recreate the database
    poetry run md2pdf --cleanup-db
    ```
-   This will drop and recreate the database table with the current schema, useful after updates
+   Use `--force` to bypass verification cache and regenerate all files (useful after rendering changes or code updates). Use `--cleanup-db` for full database reset (useful after schema changes)
 
 3. **Large diagrams cut off**: Increase maximum diagram dimensions
    ```bash
