@@ -69,13 +69,15 @@ class MarkdownToPDFConverter:
         }
     }
     
-    def __init__(self, source_dir: str, output_dir: str, temp_dir: str, page_margins: str = "1in 0.75in", debug: bool = False, db_path: Optional[str] = None, style_profile: str = "a4-print", max_workers: int = 4, max_diagram_width = 1680, max_diagram_height = 2240, force_regenerate: bool = False):
+    def __init__(self, source_dir: str, output_dir: str, temp_dir: str, page_margins: str = "1in 0.75in", debug: bool = False, db_path: Optional[str] = None, style_profile: str = "a4-print", max_workers: int = 4, max_diagram_width = 1680, max_diagram_height = 2240, force_regenerate: bool = False, save_html: bool = False, save_html_bundle: bool = False):
         """Initialize the converter.
         
         Args:
             max_diagram_width: Max width in pixels (int, only resize if rendered exceeds) or percentage of rendered size (str like "80%")
             max_diagram_height: Max height in pixels (int, only resize if rendered exceeds) or percentage of rendered size (str like "80%")
             force_regenerate: If True, bypass verification and regenerate all files
+            save_html: If True, save the intermediate HTML alongside the PDF
+            save_html_bundle: If True, save HTML with external image assets in output/html/{stem}/
         """
         self.source_dir = Path(source_dir)
         self.output_dir = Path(output_dir)
@@ -87,6 +89,8 @@ class MarkdownToPDFConverter:
         self.diagram_width = max_diagram_width
         self.diagram_height = max_diagram_height
         self.force_regenerate = force_regenerate
+        self.save_html = save_html
+        self.save_html_bundle = save_html_bundle
         self._lock = threading.Lock()  # For logging in sequential mode
         
         # Browser and event loop state (process-isolated; each worker process gets its own converter)
@@ -100,8 +104,9 @@ class MarkdownToPDFConverter:
         self._plantuml_client = plantuml.PlantUML(url=self._plantuml_server)
         self._log_debug(f"Using PlantUML server: {self._plantuml_server}")
         
-        # Create format-specific output directory
+        # Create format-specific output directories
         self.pdf_dir = self.output_dir / "pdf"
+        self.html_dir = self.output_dir / "html" if self.save_html else None
         
         # Validate style profile
         if style_profile not in self.STYLE_PROFILES:
@@ -117,6 +122,8 @@ class MarkdownToPDFConverter:
         # Create directories
         self.output_dir.mkdir(exist_ok=True)
         self.pdf_dir.mkdir(exist_ok=True)
+        if self.html_dir:
+            self.html_dir.mkdir(exist_ok=True)
         self.temp_dir.mkdir(exist_ok=True)
         
         # Log style profile information
@@ -1539,6 +1546,61 @@ class MarkdownToPDFConverter:
         
         return False
     
+    def _save_html_bundle(self, enhanced_html: str, md_file: Path) -> None:
+        """Save the styled HTML with image assets as external files.
+        
+        Creates output/html/{stem}/{stem}.html with an assets/ subdirectory
+        containing all referenced images. Absolute temp-dir paths in the HTML
+        are rewritten to relative assets/ paths.
+        """
+        import re
+        
+        stem = md_file.stem
+        bundle_dir = self.output_dir / "html" / stem
+        assets_dir = bundle_dir / "assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        
+        html = enhanced_html
+        temp_prefix = str(self.temp_dir)
+        
+        # Find all src="..." and url(...) references pointing to temp-dir files
+        # Covers <img src="...">, CSS url(...), and any other src attributes
+        patterns = [
+            (r'src="([^"]*)"', 'src="{}"'),
+            (r"src='([^']*)'", "src='{}'"),
+            (r'url\(([^)]+)\)', 'url({})'),
+        ]
+        
+        copied_files: dict[str, str] = {}  # abs_path -> relative asset path
+        
+        for pattern, template in patterns:
+            for match in re.finditer(pattern, html):
+                file_ref = match.group(1).strip().strip("'\"")
+                
+                if not file_ref.startswith(temp_prefix) and not file_ref.startswith('/'):
+                    continue
+                
+                ref_path = Path(file_ref)
+                if not ref_path.exists() or not ref_path.is_file():
+                    continue
+                
+                # Copy once, reuse the relative path for duplicates
+                abs_key = str(ref_path)
+                if abs_key not in copied_files:
+                    asset_name = ref_path.name
+                    dest = assets_dir / asset_name
+                    shutil.copy2(ref_path, dest)
+                    copied_files[abs_key] = f"assets/{asset_name}"
+                
+                # Replace the absolute path with the relative one
+                html = html.replace(file_ref, copied_files[abs_key])
+        
+        output_html = bundle_dir / f"{stem}.html"
+        with open(output_html, 'w', encoding='utf-8') as f:
+            f.write(html)
+        
+        self._log_info(f"Saved HTML bundle to {bundle_dir} ({len(copied_files)} assets)")
+    
     def _convert_single_file(self, md_file: Path) -> tuple[str, str]:
         """Convert a single markdown file to PDF. Returns (status, filename).
         
@@ -1651,6 +1713,14 @@ class MarkdownToPDFConverter:
                 enhanced_html_file = self.temp_dir / f"enhanced_{md_file.stem}.html"
                 with open(enhanced_html_file, 'w', encoding='utf-8') as f:
                     f.write(enhanced_html)
+                
+                # Save HTML output if requested
+                if self.html_dir:
+                    output_html = self.html_dir / f"{md_file.stem}.html"
+                    shutil.copy2(enhanced_html_file, output_html)
+                    self._log_debug(f"Saved HTML to {output_html}")
+                if self.save_html_bundle:
+                    self._save_html_bundle(enhanced_html, md_file)
                 pbar.update(1)
                 
                 # Step 6: Convert to PDF
@@ -1714,6 +1784,8 @@ class MarkdownToPDFConverter:
             'max_diagram_width': self.diagram_width,
             'max_diagram_height': self.diagram_height,
             'force_regenerate': self.force_regenerate,
+            'save_html': self.save_html,
+            'save_html_bundle': self.save_html_bundle,
         }
     
     def _convert_all_parallel(self, md_files: List[Path], cleanup: bool) -> None:
@@ -1814,6 +1886,8 @@ def main():
     parser.add_argument("--max-diagram-width", type=str, default=None, help="Maximum diagram width: pixels (e.g., 1680, only if rendered exceeds) or percentage of rendered size (e.g., 80%%, max 100%%). Default: 1680")
     parser.add_argument("--max-diagram-height", type=str, default=None, help="Maximum diagram height: pixels (e.g., 2240, only if rendered exceeds) or percentage of rendered size (e.g., 80%%, max 100%%). Default: 2240")
     parser.add_argument("--force", action="store_true", help="Force regeneration of all files, bypassing document verification")
+    parser.add_argument("--save-html", action="store_true", help="Save the intermediate HTML files alongside PDFs (output/html/)")
+    parser.add_argument("--save-html-bundle", action="store_true", help="Save HTML with external image assets in output/html/{name}/")
     
     args = parser.parse_args()
     
@@ -1869,7 +1943,9 @@ def main():
         max_workers=args.max_workers,
         max_diagram_width=config.get_max_diagram_width(),
         max_diagram_height=config.get_max_diagram_height(),
-        force_regenerate=args.force
+        force_regenerate=args.force,
+        save_html=args.save_html,
+        save_html_bundle=args.save_html_bundle
     )
     converter.convert_all(cleanup=not args.no_cleanup, parallel=not args.no_parallel)
 
