@@ -308,26 +308,95 @@ class MarkdownToPDFConverter:
     def _get_viewport_dimensions(self) -> tuple[int, int]:
         """Get viewport dimensions for diagram rendering (always integers).
         
+        The viewport is set larger than the target output dimensions so diagrams
+        render at their natural size with full detail.  The final image size is
+        then determined by _fit_diagram_to_page_width and scale annotations.
+        
         Returns:
             Tuple of (width, height) in pixels for viewport size
         """
-        # Default viewport size for rendering
-        default_width = 1680
-        default_height = 2240
+        # Use 2x the target max dimensions so diagrams have room to
+        # lay out at full fidelity before being fit to page width.
+        default_width = 3360
+        default_height = 4480
         
-        # If diagram dimensions are integers, use them for viewport
-        # If they're percentages, use defaults (resizing happens after rendering)
         if isinstance(self.diagram_width, int):
-            width = self.diagram_width
+            width = self.diagram_width * 2
         else:
             width = default_width
             
         if isinstance(self.diagram_height, int):
-            height = self.diagram_height
+            height = self.diagram_height * 2
         else:
             height = default_height
             
         return width, height
+    
+    def _get_page_width_px(self) -> int:
+        """Get the target page content width in pixels for diagram sizing.
+        
+        Returns self.diagram_width if it's an integer, otherwise 1680 as default.
+        """
+        if isinstance(self.diagram_width, int):
+            return self.diagram_width
+        return 1680
+    
+    def _fit_diagram_to_page_width(self, image_path: Path, scale_percent: float = 100.0) -> bool:
+        """Resize a diagram image so its width equals page_width * scale_percent / 100.
+        
+        Unlike _resize_image (which only shrinks), this always resizes — up or down —
+        so the diagram fills the intended portion of the page width.
+        
+        Args:
+            image_path: Path to the rendered diagram PNG
+            scale_percent: Target width as percentage of page width (100 = full width)
+            
+        Returns:
+            True if successful
+        """
+        try:
+            target_width = int(self._get_page_width_px() * scale_percent / 100.0)
+            
+            with Image.open(image_path) as img:
+                if img.mode not in ('RGB', 'RGBA'):
+                    if img.mode in ('P', 'PA', 'LA') and 'transparency' in img.info:
+                        img = img.convert('RGBA')
+                    else:
+                        img = img.convert('RGB')
+                
+                orig_width, orig_height = img.size
+                
+                if orig_width == target_width:
+                    self._log_debug(f"Diagram already at target width {target_width}px")
+                    return True
+                
+                scale_factor = target_width / orig_width
+                new_width = target_width
+                new_height = int(orig_height * scale_factor)
+                
+                is_upscaling = scale_factor > 1.0
+                resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                
+                # Apply sharpening
+                if is_upscaling:
+                    sharpened = resized.filter(ImageFilter.UnsharpMask(radius=1.0, percent=200, threshold=2))
+                else:
+                    sharpened = resized.filter(ImageFilter.UnsharpMask(radius=0.5, percent=150, threshold=3))
+                
+                if image_path.suffix.lower() in ['.png']:
+                    sharpened.save(image_path, format='PNG', compress_level=6, optimize=False)
+                elif image_path.suffix.lower() in ['.jpg', '.jpeg']:
+                    sharpened.save(image_path, format='JPEG', quality=100, subsampling=0, optimize=False)
+                else:
+                    sharpened.save(image_path, optimize=False)
+                
+                direction = "upscaled" if is_upscaling else "downscaled"
+                self._log_debug(f"Fit diagram to page: {orig_width}x{orig_height} -> {new_width}x{new_height} ({direction}, {scale_percent}% of page width)")
+            
+            return True
+        except Exception as e:
+            self._log_warning(f"Failed to fit diagram to page width: {e}")
+            return False
     
     def _parse_dimension_value(self, value, original_size: int) -> Optional[int]:
         """Parse dimension value that can be max pixels (int) or percentage (str).
@@ -642,20 +711,54 @@ class MarkdownToPDFConverter:
                     else:
                         self._log_warning(f"Mermaid diagram dimensions did not stabilize after {max_wait_time}ms")
             
-            # Get the mermaid element and take screenshot of just that element
+            # Scale the SVG up to the target page width BEFORE rasterizing.
+            # SVGs are vector graphics, so this produces a perfectly crisp image
+            # at any resolution — no blurry upscaling of a small raster.
+            target_width = self._get_page_width_px()
+            scaled = await page.evaluate(f"""() => {{
+                const svg = document.querySelector('.mermaid svg');
+                if (!svg) return false;
+                const viewBox = svg.getAttribute('viewBox');
+                if (viewBox) {{
+                    const parts = viewBox.split(/[\\s,]+/);
+                    const natW = parseFloat(parts[2]);
+                    const natH = parseFloat(parts[3]);
+                    if (natW > 0 && natH > 0) {{
+                        const scale = {target_width} / natW;
+                        svg.setAttribute('width', {target_width});
+                        svg.setAttribute('height', Math.ceil(natH * scale));
+                        svg.style.maxWidth = 'none';
+                        return true;
+                    }}
+                }}
+                // Fallback: use current rendered size
+                const rect = svg.getBoundingClientRect();
+                if (rect.width > 0) {{
+                    const scale = {target_width} / rect.width;
+                    svg.setAttribute('width', {target_width});
+                    svg.setAttribute('height', Math.ceil(rect.height * scale));
+                    svg.style.maxWidth = 'none';
+                    return true;
+                }}
+                return false;
+            }}""")
+            if scaled:
+                self._log_debug(f"Scaled SVG to {target_width}px wide before rasterization")
+            
+            # Brief pause for the browser to re-layout at the new SVG size
+            await page.wait_for_timeout(100)
+            
+            # Take screenshot of the scaled element
             mermaid_element = await page.query_selector('.mermaid')
             if mermaid_element:
-                # Get the bounding box of the mermaid element
                 bounding_box = await mermaid_element.bounding_box()
                 if bounding_box:
-                    # Take high-resolution screenshot of just the mermaid element
                     await mermaid_element.screenshot(
                         path=str(output_path), 
                         type='png',
                         scale='device'
                     )
                 else:
-                    # Fallback to full page if bounding box not available
                     await page.screenshot(
                         path=str(output_path), 
                         type='png', 
@@ -663,7 +766,6 @@ class MarkdownToPDFConverter:
                         scale='device'
                     )
             else:
-                # Fallback to full page if mermaid element not found
                 await page.screenshot(
                     path=str(output_path), 
                     type='png', 
@@ -773,13 +875,13 @@ class MarkdownToPDFConverter:
             
             # Determine resize behavior
             skip_resize = no_resize_modifier is not None
-            custom_scale = None
+            target_scale = 100.0  # Default: fill page width
             if scale_percent:
                 percent_value = float(scale_percent)
                 if percent_value > 0:
-                    custom_scale = f"{scale_percent}%"
+                    target_scale = percent_value
                 else:
-                    self._log_warning(f"Scale percentage must be greater than 0%, got {scale_percent}%. Ignoring modifier.")
+                    self._log_warning(f"Scale percentage must be greater than 0%, got {scale_percent}%. Using default (100%).")
             
             # Create unique image path using file_id to avoid race conditions
             image_path = self.temp_dir / f"mermaid_diagram_{file_id}_{i}.png"
@@ -788,8 +890,8 @@ class MarkdownToPDFConverter:
             modifier_info = ""
             if skip_resize:
                 modifier_info = " (no-resize)"
-            elif custom_scale:
-                modifier_info = f" (scale:{custom_scale})"
+            elif target_scale != 100.0:
+                modifier_info = f" (scale:{target_scale}%)"
             self._log_debug(f"Rendering Mermaid diagram {i} to: {image_path}{modifier_info}")
             
             # Reuse event loop from file processing
@@ -799,15 +901,11 @@ class MarkdownToPDFConverter:
             if not success:
                 raise RuntimeError(f"Mermaid diagram {i} failed to render: {error_msg}")
             
-            # Resize the rendered image based on modifiers
+            # Fit diagram to page width (or scaled fraction of it)
             if skip_resize:
                 self._log_debug(f"Skipping resize for Mermaid diagram {i} due to no-resize modifier")
-            elif custom_scale:
-                self._log_debug(f"Applying custom scale {custom_scale} to Mermaid diagram {i}")
-                self._resize_image(image_path, max_width=custom_scale, max_height=custom_scale)
             else:
-                # Use default resize settings
-                self._resize_image(image_path)
+                self._fit_diagram_to_page_width(image_path, scale_percent=target_scale)
             
             self._log_debug(f"Mermaid diagram rendered successfully, using path: {image_path}")
             # Replace the code block with image reference
@@ -859,13 +957,13 @@ class MarkdownToPDFConverter:
             
             # Determine resize behavior
             skip_resize = no_resize_modifier is not None
-            custom_scale = None
+            target_scale = 100.0  # Default: fill page width
             if scale_percent:
                 percent_value = float(scale_percent)
                 if percent_value > 0:
-                    custom_scale = f"{scale_percent}%"
+                    target_scale = percent_value
                 else:
-                    self._log_warning(f"Scale percentage must be greater than 0%, got {scale_percent}%. Ignoring modifier.")
+                    self._log_warning(f"Scale percentage must be greater than 0%, got {scale_percent}%. Using default (100%).")
             
             # Create unique image path using file_id to avoid race conditions
             image_path = self.temp_dir / f"plantuml_diagram_{file_id}_{i}.png"
@@ -874,23 +972,19 @@ class MarkdownToPDFConverter:
             modifier_info = ""
             if skip_resize:
                 modifier_info = " (no-resize)"
-            elif custom_scale:
-                modifier_info = f" (scale:{custom_scale})"
+            elif target_scale != 100.0:
+                modifier_info = f" (scale:{target_scale}%)"
             self._log_debug(f"Rendering PlantUML diagram {i} to: {image_path}{modifier_info}")
             
             success, error_msg = self._render_plantuml_diagram(plantuml_code, image_path)
             if not success:
                 raise RuntimeError(f"PlantUML diagram {i} failed to render: {error_msg}")
             
-            # Resize the rendered image based on modifiers
+            # Fit diagram to page width (or scaled fraction of it)
             if skip_resize:
                 self._log_debug(f"Skipping resize for PlantUML diagram {i} due to no-resize modifier")
-            elif custom_scale:
-                self._log_debug(f"Applying custom scale {custom_scale} to PlantUML diagram {i}")
-                self._resize_image(image_path, max_width=custom_scale, max_height=custom_scale)
             else:
-                # Use default resize settings
-                self._resize_image(image_path)
+                self._fit_diagram_to_page_width(image_path, scale_percent=target_scale)
             
             self._log_debug(f"PlantUML diagram rendered successfully, using path: {image_path}")
             # Replace the code block with image reference
