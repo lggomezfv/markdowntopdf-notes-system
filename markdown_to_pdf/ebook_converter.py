@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import shutil
 import json
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import asyncio
@@ -763,31 +764,25 @@ class MarkdownToEbookConverter:
             success, error_msg = self._thread_local.event_loop.run_until_complete(
                 self._render_mermaid_diagram(mermaid_code, image_path)
             )
-            if success:
-                # Resize the rendered image based on modifiers
-                if skip_resize:
-                    self._log_debug(f"Skipping resize for Mermaid diagram {i} due to no-resize modifier")
-                elif custom_scale:
-                    self._log_debug(f"Applying custom scale {custom_scale} to Mermaid diagram {i}")
-                    self._resize_image(image_path, max_width=custom_scale, max_height=custom_scale)
-                else:
-                    # Use default resize settings
-                    self._resize_image(image_path)
-                
-                self._log_debug(f"Mermaid diagram rendered successfully, using path: {image_path}")
-                # Replace the code block with image reference
-                content = content.replace(
-                    full_block,
-                    f"![]({image_path})"
-                )
+            if not success:
+                raise RuntimeError(f"Mermaid diagram {i} failed to render: {error_msg}")
+            
+            # Resize the rendered image based on modifiers
+            if skip_resize:
+                self._log_debug(f"Skipping resize for Mermaid diagram {i} due to no-resize modifier")
+            elif custom_scale:
+                self._log_debug(f"Applying custom scale {custom_scale} to Mermaid diagram {i}")
+                self._resize_image(image_path, max_width=custom_scale, max_height=custom_scale)
             else:
-                self._log_error(f"Failed to render Mermaid diagram {i}")
-                # Insert error placeholder with actual error message
-                error_placeholder = self._create_diagram_error_placeholder("Mermaid", i, mermaid_code, error_msg)
-                content = content.replace(
-                    full_block,
-                    error_placeholder
-                )
+                # Use default resize settings
+                self._resize_image(image_path)
+            
+            self._log_debug(f"Mermaid diagram rendered successfully, using path: {image_path}")
+            # Replace the code block with image reference
+            content = content.replace(
+                full_block,
+                f"![]({image_path})"
+            )
         
         return content
     
@@ -852,54 +847,27 @@ class MarkdownToEbookConverter:
             self._log_debug(f"Rendering PlantUML diagram {i} to: {image_path}{modifier_info}")
             
             success, error_msg = self._render_plantuml_diagram(plantuml_code, image_path)
-            if success:
-                # Resize the rendered image based on modifiers
-                if skip_resize:
-                    self._log_debug(f"Skipping resize for PlantUML diagram {i} due to no-resize modifier")
-                elif custom_scale:
-                    self._log_debug(f"Applying custom scale {custom_scale} to PlantUML diagram {i}")
-                    self._resize_image(image_path, max_width=custom_scale, max_height=custom_scale)
-                else:
-                    # Use default resize settings
-                    self._resize_image(image_path)
-                
-                self._log_debug(f"PlantUML diagram rendered successfully, using path: {image_path}")
-                # Replace the code block with image reference
-                content = content.replace(
-                    full_block,
-                    f"![]({image_path})"
-                )
+            if not success:
+                raise RuntimeError(f"PlantUML diagram {i} failed to render: {error_msg}")
+            
+            # Resize the rendered image based on modifiers
+            if skip_resize:
+                self._log_debug(f"Skipping resize for PlantUML diagram {i} due to no-resize modifier")
+            elif custom_scale:
+                self._log_debug(f"Applying custom scale {custom_scale} to PlantUML diagram {i}")
+                self._resize_image(image_path, max_width=custom_scale, max_height=custom_scale)
             else:
-                self._log_error(f"Failed to render PlantUML diagram {i}")
-                # Insert error placeholder with actual error message
-                error_placeholder = self._create_diagram_error_placeholder("PlantUML", i, plantuml_code, error_msg)
-                content = content.replace(
-                    full_block,
-                    error_placeholder
-                )
+                # Use default resize settings
+                self._resize_image(image_path)
+            
+            self._log_debug(f"PlantUML diagram rendered successfully, using path: {image_path}")
+            # Replace the code block with image reference
+            content = content.replace(
+                full_block,
+                f"![]({image_path})"
+            )
         
         return content
-    
-    def _create_diagram_error_placeholder(self, diagram_type: str, diagram_index: int, diagram_code: str, error_message: str = "") -> str:
-        """Create a formatted error placeholder for failed diagram rendering."""
-        # Truncate diagram code for display (first 60 characters)
-        truncated_code = diagram_code[:60] + "..." if len(diagram_code) > 60 else diagram_code
-        
-        # Create a compact formatted error message
-        error_placeholder = f"""
-<div style="border: 1px solid #ff6b6b; border-radius: 4px; padding: 8px; margin: 8px 0; background-color: #fff5f5; font-family: Arial, sans-serif; font-size: 0.85em;">
-    <div style="color: #d63031; font-weight: bold; margin-bottom: 4px;">
-        ⚠️ {diagram_type} Diagram Failed
-    </div>
-    <div style="color: #2d3436; margin-bottom: 4px; font-size: 0.9em;">
-        <strong>Error:</strong> {error_message if error_message else "Unknown error occurred during diagram rendering"}
-    </div>
-    <div style="color: #636e72; font-size: 0.8em; margin-bottom: 2px;">
-        <strong>Code:</strong> <code style="background-color: #f8f9fa; padding: 1px 3px; border-radius: 2px;">{truncated_code}</code>
-    </div>
-</div>
-"""
-        return error_placeholder
     
     def _process_page_breaks(self, content: str) -> str:
         """Process page break markers in markdown content."""
@@ -1693,8 +1661,11 @@ a { color: #0066cc; text-decoration: none; }
             self._log_error(f"Failed to convert EPUB to MOBI: {e}")
             return False
     
-    def _convert_single_file(self, md_file: Path) -> tuple[bool, str]:
-        """Convert a single markdown file to the specified format."""
+    def _convert_single_file(self, md_file: Path) -> tuple[str, str]:
+        """Convert a single markdown file to the specified format. Returns (status, filename).
+        
+        Status is one of: 'converted', 'skipped', 'failed'.
+        """
         try:
             filename = md_file.name
             output_file = self.format_output_dir / f"{md_file.stem}.{self.output_format}"
@@ -1708,13 +1679,13 @@ a { color: #0066cc; text-decoration: none; }
                     self.diagram_width, self.diagram_height, None, False
                 ):
                     self._log_info(f"Skipping {filename} - {self.output_format.upper()} is up to date")
-                    return True, filename
+                    return "skipped", filename
             
             try:
                 if self._convert_md_to_format(md_file, output_file):
-                    return True, filename
+                    return "converted", filename
                 else:
-                    return False, filename
+                    return "failed", filename
             finally:
                 # Clean up browser and event loop resources after processing file (thread-safe)
                 tls = self._thread_local
@@ -1725,7 +1696,7 @@ a { color: #0066cc; text-decoration: none; }
                 
         except Exception as e:
             self._log_error(f"Error processing {md_file.name}: {e}")
-            return False, md_file.name
+            return "failed", md_file.name
     
     def _convert_md_to_format(self, md_file: Path, output_file: Path) -> bool:
         """Convert markdown file to the specified format."""
@@ -1927,24 +1898,13 @@ a { color: #0066cc; text-decoration: none; }
                 for future in as_completed(future_to_file):
                     md_file = future_to_file[future]
                     try:
-                        success, filename = future.result()
-                        if success:
-                            # Check if it was actually converted or just skipped (unless force_regenerate is True)
-                            if not self.force_regenerate:
-                                current_markdown_hash = calculate_file_hash(md_file)
-                                output_file = self.format_output_dir / f"{md_file.stem}.{self.output_format}"
-                                
-                                if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_file, self.style_profile,
-                                                                             self.diagram_width, self.diagram_height, None, False):
-                                    skipped_count += 1
-                                    pbar.set_postfix_str(f"Skipped: {filename}")
-                                else:
-                                    success_count += 1
-                                    pbar.set_postfix_str(f"Converted: {filename}")
-                            else:
-                                # Force regenerate means all files are converted
-                                success_count += 1
-                                pbar.set_postfix_str(f"Converted: {filename}")
+                        status, filename = future.result()
+                        if status == "converted":
+                            success_count += 1
+                            pbar.set_postfix_str(f"Converted: {filename}")
+                        elif status == "skipped":
+                            skipped_count += 1
+                            pbar.set_postfix_str(f"Skipped: {filename}")
                         else:
                             failed_count += 1
                             pbar.set_postfix_str(f"Failed: {filename}")
@@ -1967,29 +1927,20 @@ a { color: #0066cc; text-decoration: none; }
         """Convert files sequentially."""
         success_count = 0
         skipped_count = 0
+        failed_count = 0
         
         # Use progress bar for sequential conversion
         for md_file in tqdm(md_files, desc="Converting files", unit="file"):
-            success, filename = self._convert_single_file(md_file)
-            if success:
-                # Check if it was actually converted or just skipped (unless force_regenerate is True)
-                if not self.force_regenerate:
-                    current_markdown_hash = calculate_file_hash(md_file)
-                    output_file = self.format_output_dir / f"{md_file.stem}.{self.output_format}"
-                    
-                    if not self.state_manager.needs_regeneration(
-                        filename, current_markdown_hash, output_file, self.style_profile,
-                        self.diagram_width, self.diagram_height, None, False
-                    ):
-                        skipped_count += 1
-                    else:
-                        success_count += 1
-                else:
-                    # Force regenerate means all files are converted
-                    success_count += 1
+            status, filename = self._convert_single_file(md_file)
+            if status == "converted":
+                success_count += 1
+            elif status == "skipped":
+                skipped_count += 1
+            else:
+                failed_count += 1
         
-        total_processed = success_count + skipped_count
-        self._log_success(f"Sequential conversion complete: {success_count} files converted, {skipped_count} files skipped ({total_processed}/{len(md_files)} total)")
+        total_processed = success_count + skipped_count + failed_count
+        self._log_success(f"Sequential conversion complete: {success_count} files converted, {skipped_count} files skipped, {failed_count} files failed ({total_processed}/{len(md_files)} total)")
         self._log_info(f"{self.output_format.upper()} files saved to: {self.format_output_dir.absolute()}")
         
         if cleanup:

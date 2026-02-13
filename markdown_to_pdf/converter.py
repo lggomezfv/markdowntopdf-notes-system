@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import shutil
 import json
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import asyncio
@@ -626,36 +627,58 @@ class MarkdownToPDFConverter:
             self._log_error(error_msg)
             return False, error_msg
     
-    def _render_plantuml_diagram(self, plantuml_code: str, output_path: Path) -> tuple[bool, str]:
-        """Render PlantUML diagram to image using the plantuml library."""
-        try:
-            # Reuse PlantUML client instance for connection pooling
-            # Render the diagram to PNG and get raw image data
-            image_data = self._plantuml_client.processes(plantuml_code)
-            
-            # Write the image data to file
-            with open(output_path, 'wb') as f:
-                f.write(image_data)
-            
-            # Check if the file was created successfully
-            if output_path.exists() and output_path.stat().st_size > 0:
-                self._log_debug(f"PlantUML diagram rendered successfully to: {output_path}")
-                return True, ""
-            else:
-                error_msg = "PlantUML diagram file was not created or is empty"
-                self._log_error(error_msg)
-                return False, error_msg
-                
-        except Exception as e:
-            # Handle exception carefully - some PlantUML exceptions don't have proper string representation
-            error_type = type(e).__name__
+    def _render_plantuml_diagram(self, plantuml_code: str, output_path: Path, max_retries: int = 3) -> tuple[bool, str]:
+        """Render PlantUML diagram to image using the plantuml library.
+        
+        Retries on transient network errors (SSL, connection, timeout) with exponential backoff.
+        """
+        last_error_msg = ""
+        
+        for attempt in range(1, max_retries + 1):
             try:
-                error_details = str(e)
-            except:
-                error_details = "Unknown error (exception string conversion failed)"
-            error_msg = f"Failed to render PlantUML diagram: {error_type}: {error_details}"
-            self._log_error(error_msg)
-            return False, error_msg
+                # Reuse PlantUML client instance for connection pooling
+                # Render the diagram to PNG and get raw image data
+                image_data = self._plantuml_client.processes(plantuml_code)
+                
+                # Write the image data to file
+                with open(output_path, 'wb') as f:
+                    f.write(image_data)
+                
+                # Check if the file was created successfully
+                if output_path.exists() and output_path.stat().st_size > 0:
+                    if attempt > 1:
+                        self._log_debug(f"PlantUML diagram rendered successfully on attempt {attempt}")
+                    self._log_debug(f"PlantUML diagram rendered successfully to: {output_path}")
+                    return True, ""
+                else:
+                    last_error_msg = "PlantUML diagram file was not created or is empty"
+                    self._log_error(last_error_msg)
+                    return False, last_error_msg
+                    
+            except Exception as e:
+                # Handle exception carefully - some PlantUML exceptions don't have proper string representation
+                error_type = type(e).__name__
+                try:
+                    error_details = str(e)
+                except:
+                    error_details = "Unknown error (exception string conversion failed)"
+                last_error_msg = f"Failed to render PlantUML diagram: {error_type}: {error_details}"
+                
+                # Check if this is a transient network error worth retrying
+                transient_keywords = ["SSL", "SSLError", "ConnectionError", "ConnectionReset", 
+                                      "TimeoutError", "Timeout", "BrokenPipe", "RemoteDisconnected"]
+                is_transient = any(kw.lower() in last_error_msg.lower() for kw in transient_keywords)
+                
+                if is_transient and attempt < max_retries:
+                    wait_time = 2 ** attempt  # 2s, 4s
+                    self._log_warning(f"PlantUML request failed (attempt {attempt}/{max_retries}): {error_type}. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    self._log_error(last_error_msg)
+                    return False, last_error_msg
+        
+        # Should not reach here, but just in case
+        return False, last_error_msg
     
     def _replace_mermaid_with_images(self, content: str, file_id: str = "", filename: str = "") -> str:
         """Replace Mermaid code blocks with image references.
@@ -719,31 +742,25 @@ class MarkdownToPDFConverter:
             success, error_msg = self._thread_local.event_loop.run_until_complete(
                 self._render_mermaid_diagram(mermaid_code, image_path)
             )
-            if success:
-                # Resize the rendered image based on modifiers
-                if skip_resize:
-                    self._log_debug(f"Skipping resize for Mermaid diagram {i} due to no-resize modifier")
-                elif custom_scale:
-                    self._log_debug(f"Applying custom scale {custom_scale} to Mermaid diagram {i}")
-                    self._resize_image(image_path, max_width=custom_scale, max_height=custom_scale)
-                else:
-                    # Use default resize settings
-                    self._resize_image(image_path)
-                
-                self._log_debug(f"Mermaid diagram rendered successfully, using path: {image_path}")
-                # Replace the code block with image reference
-                content = content.replace(
-                    full_block,
-                    f"![]({image_path})"
-                )
+            if not success:
+                raise RuntimeError(f"Mermaid diagram {i} failed to render: {error_msg}")
+            
+            # Resize the rendered image based on modifiers
+            if skip_resize:
+                self._log_debug(f"Skipping resize for Mermaid diagram {i} due to no-resize modifier")
+            elif custom_scale:
+                self._log_debug(f"Applying custom scale {custom_scale} to Mermaid diagram {i}")
+                self._resize_image(image_path, max_width=custom_scale, max_height=custom_scale)
             else:
-                self._log_error(f"Failed to render Mermaid diagram {i}")
-                # Insert error placeholder with actual error message
-                error_placeholder = self._create_diagram_error_placeholder("Mermaid", i, mermaid_code, error_msg)
-                content = content.replace(
-                    full_block,
-                    error_placeholder
-                )
+                # Use default resize settings
+                self._resize_image(image_path)
+            
+            self._log_debug(f"Mermaid diagram rendered successfully, using path: {image_path}")
+            # Replace the code block with image reference
+            content = content.replace(
+                full_block,
+                f"![]({image_path})"
+            )
         
         return content
     
@@ -808,54 +825,27 @@ class MarkdownToPDFConverter:
             self._log_debug(f"Rendering PlantUML diagram {i} to: {image_path}{modifier_info}")
             
             success, error_msg = self._render_plantuml_diagram(plantuml_code, image_path)
-            if success:
-                # Resize the rendered image based on modifiers
-                if skip_resize:
-                    self._log_debug(f"Skipping resize for PlantUML diagram {i} due to no-resize modifier")
-                elif custom_scale:
-                    self._log_debug(f"Applying custom scale {custom_scale} to PlantUML diagram {i}")
-                    self._resize_image(image_path, max_width=custom_scale, max_height=custom_scale)
-                else:
-                    # Use default resize settings
-                    self._resize_image(image_path)
-                
-                self._log_debug(f"PlantUML diagram rendered successfully, using path: {image_path}")
-                # Replace the code block with image reference
-                content = content.replace(
-                    full_block,
-                    f"![]({image_path})"
-                )
+            if not success:
+                raise RuntimeError(f"PlantUML diagram {i} failed to render: {error_msg}")
+            
+            # Resize the rendered image based on modifiers
+            if skip_resize:
+                self._log_debug(f"Skipping resize for PlantUML diagram {i} due to no-resize modifier")
+            elif custom_scale:
+                self._log_debug(f"Applying custom scale {custom_scale} to PlantUML diagram {i}")
+                self._resize_image(image_path, max_width=custom_scale, max_height=custom_scale)
             else:
-                self._log_error(f"Failed to render PlantUML diagram {i}")
-                # Insert error placeholder with actual error message
-                error_placeholder = self._create_diagram_error_placeholder("PlantUML", i, plantuml_code, error_msg)
-                content = content.replace(
-                    full_block,
-                    error_placeholder
-                )
+                # Use default resize settings
+                self._resize_image(image_path)
+            
+            self._log_debug(f"PlantUML diagram rendered successfully, using path: {image_path}")
+            # Replace the code block with image reference
+            content = content.replace(
+                full_block,
+                f"![]({image_path})"
+            )
         
         return content
-    
-    def _create_diagram_error_placeholder(self, diagram_type: str, diagram_index: int, diagram_code: str, error_message: str = "") -> str:
-        """Create a formatted error placeholder for failed diagram rendering."""
-        # Truncate diagram code for display (first 60 characters)
-        truncated_code = diagram_code[:60] + "..." if len(diagram_code) > 60 else diagram_code
-        
-        # Create a compact formatted error message
-        error_placeholder = f"""
-<div style="border: 1px solid #ff6b6b; border-radius: 4px; padding: 8px; margin: 8px 0; background-color: #fff5f5; font-family: Arial, sans-serif; font-size: 0.85em;">
-    <div style="color: #d63031; font-weight: bold; margin-bottom: 4px;">
-        ⚠️ {diagram_type} Diagram Failed
-    </div>
-    <div style="color: #2d3436; margin-bottom: 4px; font-size: 0.9em;">
-        <strong>Error:</strong> {error_message if error_message else "Unknown error occurred during diagram rendering"}
-    </div>
-    <div style="color: #636e72; font-size: 0.8em; margin-bottom: 2px;">
-        <strong>Code:</strong> <code style="background-color: #f8f9fa; padding: 1px 3px; border-radius: 2px;">{truncated_code}</code>
-    </div>
-</div>
-"""
-        return error_placeholder
     
     def _process_page_breaks(self, content: str) -> str:
         """Process page break markers in markdown content."""
@@ -1382,8 +1372,11 @@ class MarkdownToPDFConverter:
             self._log_error(f"Failed to convert HTML to PDF: {e}")
             return False
     
-    def _convert_single_file(self, md_file: Path) -> tuple[bool, str]:
-        """Convert a single markdown file to PDF. Returns (success, filename)."""
+    def _convert_single_file(self, md_file: Path) -> tuple[str, str]:
+        """Convert a single markdown file to PDF. Returns (status, filename).
+        
+        Status is one of: 'converted', 'skipped', 'failed'.
+        """
         try:
             filename = md_file.name
             output_pdf = self.pdf_dir / f"{md_file.stem}.pdf"
@@ -1395,13 +1388,13 @@ class MarkdownToPDFConverter:
                 if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf, self.style_profile,
                                                             self.diagram_width, self.diagram_height, self.page_margins, True):
                     self._log_info(f"Skipping {filename} - PDF is up to date")
-                    return True, filename  # Success but skipped
+                    return "skipped", filename
             
             try:
                 if self._convert_md_to_pdf(md_file, output_pdf):
-                    return True, filename
+                    return "converted", filename
                 else:
-                    return False, filename
+                    return "failed", filename
             finally:
                 # Clean up browser and event loop resources after processing file (thread-safe)
                 tls = self._thread_local
@@ -1412,7 +1405,7 @@ class MarkdownToPDFConverter:
                 
         except Exception as e:
             self._log_error(f"Error processing {md_file.name}: {e}")
-            return False, md_file.name
+            return "failed", md_file.name
 
     def _convert_md_to_pdf(self, md_file: Path, output_pdf: Path) -> bool:
         """Convert markdown file to PDF."""
@@ -1549,24 +1542,13 @@ class MarkdownToPDFConverter:
                 for future in as_completed(future_to_file):
                     md_file = future_to_file[future]
                     try:
-                        success, filename = future.result()
-                        if success:
-                            # Check if it was actually converted or just skipped (unless force_regenerate is True)
-                            if not self.force_regenerate:
-                                current_markdown_hash = calculate_file_hash(md_file)
-                                output_pdf = self.pdf_dir / f"{md_file.stem}.pdf"
-                                
-                                if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf, self.style_profile,
-                                                                             self.diagram_width, self.diagram_height, self.page_margins, True):
-                                    skipped_count += 1
-                                    pbar.set_postfix_str(f"Skipped: {filename}")
-                                else:
-                                    success_count += 1
-                                    pbar.set_postfix_str(f"Converted: {filename}")
-                            else:
-                                # Force regenerate means all files are converted
-                                success_count += 1
-                                pbar.set_postfix_str(f"Converted: {filename}")
+                        status, filename = future.result()
+                        if status == "converted":
+                            success_count += 1
+                            pbar.set_postfix_str(f"Converted: {filename}")
+                        elif status == "skipped":
+                            skipped_count += 1
+                            pbar.set_postfix_str(f"Skipped: {filename}")
                         else:
                             failed_count += 1
                             pbar.set_postfix_str(f"Failed: {filename}")
@@ -1589,29 +1571,20 @@ class MarkdownToPDFConverter:
         """Convert files sequentially (original implementation)."""
         success_count = 0
         skipped_count = 0
+        failed_count = 0
         
         # Use progress bar for sequential conversion
         for md_file in tqdm(md_files, desc="Converting files", unit="file"):
-            success, filename = self._convert_single_file(md_file)
-            if success:
-                # Check if it was actually converted or just skipped (unless force_regenerate is True)
-                if not self.force_regenerate:
-                    current_markdown_hash = calculate_file_hash(md_file)
-                    output_pdf = self.pdf_dir / f"{md_file.stem}.pdf"
-                    
-                    if not self.state_manager.needs_regeneration(
-                        filename, current_markdown_hash, output_pdf, self.style_profile,
-                        self.diagram_width, self.diagram_height, self.page_margins, True
-                    ):
-                        skipped_count += 1
-                    else:
-                        success_count += 1
-                else:
-                    # Force regenerate means all files are converted
-                    success_count += 1
+            status, filename = self._convert_single_file(md_file)
+            if status == "converted":
+                success_count += 1
+            elif status == "skipped":
+                skipped_count += 1
+            else:
+                failed_count += 1
         
-        total_processed = success_count + skipped_count
-        self._log_success(f"Sequential conversion complete: {success_count} files converted, {skipped_count} files skipped ({total_processed}/{len(md_files)} total)")
+        total_processed = success_count + skipped_count + failed_count
+        self._log_success(f"Sequential conversion complete: {success_count} files converted, {skipped_count} files skipped, {failed_count} files failed ({total_processed}/{len(md_files)} total)")
         self._log_info(f"PDF files saved to: {self.pdf_dir.absolute()}")
         
         if cleanup:
