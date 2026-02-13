@@ -218,3 +218,4 @@ __marimo__/
 document_state.db
 /output
 /my-pdfs
+.python-version

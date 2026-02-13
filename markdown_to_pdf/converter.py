@@ -23,9 +23,28 @@ from PIL import Image, ImageFilter
 from .verification import DocumentStateManager, calculate_file_hash
 from .config import Config
 from .dependencies import check_dependencies
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import threading
+import multiprocessing
 from tqdm import tqdm
+
+# --- Module-level worker infrastructure for ProcessPoolExecutor ---
+# ProcessPoolExecutor requires picklable callables. We use a module-level
+# converter instance per worker process so each gets its own browser, event
+# loop, and DB connection — fully isolated from other workers.
+_worker_converter = None
+
+
+def _init_worker_process(converter_kwargs: dict) -> None:
+    """Initializer called once per worker process. Creates a process-local converter."""
+    global _worker_converter
+    _worker_converter = MarkdownToPDFConverter(**converter_kwargs)
+
+
+def _worker_convert_file(md_file: Path) -> tuple:
+    """Top-level function executed in worker process. Converts a single file."""
+    return _worker_converter._convert_single_file(md_file)
+
 
 # Initialize colorama for cross-platform colored output
 init(autoreset=True)
@@ -68,18 +87,18 @@ class MarkdownToPDFConverter:
         self.diagram_width = max_diagram_width
         self.diagram_height = max_diagram_height
         self.force_regenerate = force_regenerate
-        self._lock = threading.Lock()  # For thread-safe logging
+        self._lock = threading.Lock()  # For logging in sequential mode
         
-        # Performance optimization: reuse browser and event loop (thread-local for parallel safety)
-        self._thread_local = threading.local()
+        # Browser and event loop state (process-isolated; each worker process gets its own converter)
+        self._local = type('BrowserState', (), {})()
         
         # Performance optimization: reuse PlantUML client for connection pooling
         # Get PlantUML server URL from config (supports local or external server)
         from .config import Config
         config = Config()
-        plantuml_server = config.get_plantuml_server()
-        self._plantuml_client = plantuml.PlantUML(url=plantuml_server)
-        self._log_debug(f"Using PlantUML server: {plantuml_server}")
+        self._plantuml_server = config.get_plantuml_server()
+        self._plantuml_client = plantuml.PlantUML(url=self._plantuml_server)
+        self._log_debug(f"Using PlantUML server: {self._plantuml_server}")
         
         # Create format-specific output directory
         self.pdf_dir = self.output_dir / "pdf"
@@ -131,40 +150,72 @@ class MarkdownToPDFConverter:
         with self._lock:
             print(f"{Fore.GREEN}[OK]{Style.RESET_ALL} {message}")
     
+    async def _launch_browser(self) -> None:
+        """Launch a fresh Chromium browser instance."""
+        tls = self._local
+        if not hasattr(tls, 'playwright') or tls.playwright is None:
+            tls.playwright = await async_playwright().start()
+        tls.browser = await tls.playwright.chromium.launch(
+            headless=True,
+            args=[
+                '--disable-dev-shm-usage',  # Use /tmp instead of /dev/shm (prevents OOM crashes)
+                '--disable-gpu',             # No GPU in headless mode
+                '--no-sandbox',              # Required in some environments
+            ]
+        )
+    
     async def _ensure_browser(self) -> None:
-        """Ensure browser instance is initialized and ready. Reuses existing browser if available (thread-safe)."""
-        # Access thread-local storage
-        tls = self._thread_local
+        """Ensure browser instance is initialized and ready. Reuses existing browser if available."""
+        tls = self._local
         
         if not hasattr(tls, 'browser') or tls.browser is None or not tls.browser.is_connected():
-            self._log_debug("Initializing browser instance for reuse")
-            if not hasattr(tls, 'playwright') or tls.playwright is None:
-                tls.playwright = await async_playwright().start()
-            tls.browser = await tls.playwright.chromium.launch(headless=True)
+            self._log_debug("Initializing browser instance")
+            await self._launch_browser()
         
-        # Always create a new page for each render to prevent state carryover
-        # Close existing page if it exists
+        # Create a new page, restarting the browser if it turns out to be dead
         if hasattr(tls, 'page') and tls.page and not tls.page.is_closed():
-            await tls.page.close()
-        tls.page = await tls.browser.new_page()
+            try:
+                await tls.page.close()
+            except Exception:
+                pass
+        try:
+            tls.page = await tls.browser.new_page()
+        except Exception:
+            # Browser reported connected but is actually dead — restart it
+            self._log_warning("Browser connection stale, restarting...")
+            await self._close_browser()
+            await self._launch_browser()
+            tls.page = await tls.browser.new_page()
     
     async def _close_browser(self) -> None:
-        """Close browser and cleanup resources (thread-safe)."""
+        """Close browser and cleanup resources."""
+        tls = self._local
+        
+        # Grab references and null them out first to prevent double-close on crash
+        page = getattr(tls, 'page', None)
+        browser = getattr(tls, 'browser', None)
+        pw = getattr(tls, 'playwright', None)
+        tls.page = None
+        tls.browser = None
+        tls.playwright = None
+        
         try:
-            tls = self._thread_local
-            
-            if hasattr(tls, 'page') and tls.page and not tls.page.is_closed():
-                await tls.page.close()
-                tls.page = None
-            if hasattr(tls, 'browser') and tls.browser and tls.browser.is_connected():
-                await tls.browser.close()
-                tls.browser = None
-            if hasattr(tls, 'playwright') and tls.playwright:
-                await tls.playwright.stop()
-                tls.playwright = None
-            self._log_debug("Browser instance closed and cleaned up")
-        except Exception as e:
-            self._log_warning(f"Error during browser cleanup: {e}")
+            if page and not page.is_closed():
+                await page.close()
+        except Exception:
+            pass
+        try:
+            if browser and browser.is_connected():
+                await browser.close()
+        except Exception:
+            pass
+        try:
+            if pw:
+                await pw.stop()
+        except Exception:
+            pass
+        
+        self._log_debug("Browser instance closed and cleaned up")
     
     def _validate_margin(self, margin_str: str) -> str:
         """Validate and normalize a single margin value."""
@@ -439,9 +490,9 @@ class MarkdownToPDFConverter:
     async def _render_mermaid_diagram(self, mermaid_code: str, output_path: Path) -> tuple[bool, str]:
         """Render Mermaid diagram to image using Playwright."""
         try:
-            # Reuse browser instance (thread-safe)
+            # Reuse browser instance
             await self._ensure_browser()
-            page = self._thread_local.page
+            page = self._local.page
             
             # Set viewport for high-resolution rendering using fixed pixel dimensions
             viewport_width, viewport_height = self._get_viewport_dimensions()
@@ -631,14 +682,15 @@ class MarkdownToPDFConverter:
         """Render PlantUML diagram to image using the plantuml library.
         
         Retries on transient network errors (SSL, connection, timeout) with exponential backoff.
+        Creates a fresh client on each retry to avoid reusing broken connections.
         """
         last_error_msg = ""
+        client = self._plantuml_client
         
         for attempt in range(1, max_retries + 1):
             try:
-                # Reuse PlantUML client instance for connection pooling
                 # Render the diagram to PNG and get raw image data
-                image_data = self._plantuml_client.processes(plantuml_code)
+                image_data = client.processes(plantuml_code)
                 
                 # Write the image data to file
                 with open(output_path, 'wb') as f:
@@ -673,6 +725,8 @@ class MarkdownToPDFConverter:
                     wait_time = 2 ** attempt  # 2s, 4s
                     self._log_warning(f"PlantUML request failed (attempt {attempt}/{max_retries}): {error_type}. Retrying in {wait_time}s...")
                     time.sleep(wait_time)
+                    # Create a fresh client to discard any broken SSL/connection state
+                    client = plantuml.PlantUML(url=self._plantuml_server)
                 else:
                     self._log_error(last_error_msg)
                     return False, last_error_msg
@@ -738,8 +792,8 @@ class MarkdownToPDFConverter:
                 modifier_info = f" (scale:{custom_scale})"
             self._log_debug(f"Rendering Mermaid diagram {i} to: {image_path}{modifier_info}")
             
-            # Reuse event loop from file processing (thread-safe)
-            success, error_msg = self._thread_local.event_loop.run_until_complete(
+            # Reuse event loop from file processing
+            success, error_msg = self._local.event_loop.run_until_complete(
                 self._render_mermaid_diagram(mermaid_code, image_path)
             )
             if not success:
@@ -1328,49 +1382,68 @@ class MarkdownToPDFConverter:
         return stem.title() if stem else md_file.stem
     
     async def _convert_html_to_pdf(self, html_file: Path, output_pdf: Path, margins: Dict[str, str]) -> bool:
-        """Convert HTML to PDF using Playwright (Puppeteer approach)."""
-        try:
-            # Reuse browser instance (thread-safe)
-            await self._ensure_browser()
-            page = self._thread_local.page
-            
-            # Load HTML file
-            await page.goto(html_file.absolute().as_uri())
-            
-            # Wait for content to load
-            await page.wait_for_load_state('networkidle')
-            
-            # Convert margins to cm for PDF generation
-            top_cm = self._convert_margin_to_cm(margins['top'])
-            right_cm = self._convert_margin_to_cm(margins['right'])
-            bottom_cm = self._convert_margin_to_cm(margins['bottom'])
-            left_cm = self._convert_margin_to_cm(margins['left'])
-            
-            # Generate PDF with precise A4 settings
-            await page.pdf(
-                path=str(output_pdf),
-                format='A4',
-                width='210mm',
-                height='297mm',
-                margin={
-                    'top': f'{top_cm}cm',
-                    'right': f'{right_cm}cm',
-                    'bottom': f'{bottom_cm}cm',
-                    'left': f'{left_cm}cm'
-                },
-                print_background=True,
-                prefer_css_page_size=True,
-                display_header_footer=True,
-                header_template='<div></div>',
-                footer_template='<div style="font-size: 10px; text-align: center; width: 100%; margin: 0 auto;"><span class="pageNumber"></span></div>',
-                scale=1.0
-            )
-            
-            return True
-            
-        except Exception as e:
-            self._log_error(f"Failed to convert HTML to PDF: {e}")
-            return False
+        """Convert HTML to PDF using Playwright (Puppeteer approach).
+        
+        Retries once with a fresh browser if the browser process crashes mid-conversion.
+        """
+        max_attempts = 2
+        
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # Reuse browser instance
+                await self._ensure_browser()
+                page = self._local.page
+                
+                # Load HTML file
+                await page.goto(html_file.absolute().as_uri())
+                
+                # Wait for content to load
+                await page.wait_for_load_state('networkidle')
+                
+                # Convert margins to cm for PDF generation
+                top_cm = self._convert_margin_to_cm(margins['top'])
+                right_cm = self._convert_margin_to_cm(margins['right'])
+                bottom_cm = self._convert_margin_to_cm(margins['bottom'])
+                left_cm = self._convert_margin_to_cm(margins['left'])
+                
+                # Generate PDF with precise A4 settings
+                await page.pdf(
+                    path=str(output_pdf),
+                    format='A4',
+                    width='210mm',
+                    height='297mm',
+                    margin={
+                        'top': f'{top_cm}cm',
+                        'right': f'{right_cm}cm',
+                        'bottom': f'{bottom_cm}cm',
+                        'left': f'{left_cm}cm'
+                    },
+                    print_background=True,
+                    prefer_css_page_size=True,
+                    display_header_footer=True,
+                    header_template='<div></div>',
+                    footer_template='<div style="font-size: 10px; text-align: center; width: 100%; margin: 0 auto;"><span class="pageNumber"></span></div>',
+                    scale=1.0
+                )
+                
+                return True
+                
+            except Exception as e:
+                error_msg = str(e)
+                is_crash = any(kw in error_msg for kw in [
+                    "Connection closed", "Browser has been closed", "Target closed",
+                    "crashed", "Protocol error"
+                ])
+                
+                if is_crash and attempt < max_attempts:
+                    self._log_warning(f"Browser crashed during PDF generation, restarting and retrying...")
+                    # Force-reset browser state so _ensure_browser creates a fresh one
+                    await self._close_browser()
+                else:
+                    self._log_error(f"Failed to convert HTML to PDF: {e}")
+                    return False
+        
+        return False
     
     def _convert_single_file(self, md_file: Path) -> tuple[str, str]:
         """Convert a single markdown file to PDF. Returns (status, filename).
@@ -1400,8 +1473,8 @@ class MarkdownToPDFConverter:
                 else:
                     return "failed", filename
             finally:
-                # Clean up browser and event loop resources after processing file (thread-safe)
-                tls = self._thread_local
+                # Clean up browser and event loop resources after processing file
+                tls = self._local
                 if hasattr(tls, 'event_loop') and tls.event_loop:
                     tls.event_loop.run_until_complete(self._close_browser())
                     tls.event_loop.close()
@@ -1414,8 +1487,8 @@ class MarkdownToPDFConverter:
     def _convert_md_to_pdf(self, md_file: Path, output_pdf: Path) -> bool:
         """Convert markdown file to PDF."""
         try:
-            # Create event loop once for entire file processing (reuse optimization, thread-safe)
-            tls = self._thread_local
+            # Create event loop once for entire file processing
+            tls = self._local
             if not hasattr(tls, 'event_loop') or tls.event_loop is None or tls.event_loop.is_closed():
                 tls.event_loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(tls.event_loop)
@@ -1443,6 +1516,8 @@ class MarkdownToPDFConverter:
                 # Step 3: Process diagrams
                 pbar.set_description(f"  {filename} - Diagrams")
                 processed_content = self._replace_mermaid_with_images(processed_content, file_id, filename)
+                # Close browser after Mermaid rendering to free memory before PlantUML + PDF steps
+                tls.event_loop.run_until_complete(self._close_browser())
                 processed_content = self._replace_plantuml_with_images(processed_content, file_id, filename)
                 pbar.update(1)
                 
@@ -1531,15 +1606,45 @@ class MarkdownToPDFConverter:
             self._log_info("Using sequential processing")
             self._convert_all_sequential(md_files, cleanup)
     
+    def _get_constructor_kwargs(self) -> dict:
+        """Return the kwargs needed to reconstruct this converter in a worker process."""
+        return {
+            'source_dir': str(self.source_dir),
+            'output_dir': str(self.output_dir),
+            'temp_dir': str(self.temp_dir),
+            'page_margins': self.page_margins,
+            'debug': self.debug,
+            'db_path': str(self.state_manager.db_path),
+            'style_profile': self.style_profile,
+            'max_workers': 1,  # Workers don't spawn sub-workers
+            'max_diagram_width': self.diagram_width,
+            'max_diagram_height': self.diagram_height,
+            'force_regenerate': self.force_regenerate,
+        }
+    
     def _convert_all_parallel(self, md_files: List[Path], cleanup: bool) -> None:
-        """Convert files in parallel using ThreadPoolExecutor."""
+        """Convert files in parallel using ProcessPoolExecutor.
+        
+        Each worker runs in its own OS process with a separate Chromium instance,
+        so a browser crash in one worker cannot corrupt other workers or the main process.
+        """
         success_count = 0
         skipped_count = 0
         failed_count = 0
         
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        converter_kwargs = self._get_constructor_kwargs()
+        
+        # Use 'spawn' context to get clean processes (no forked Playwright state)
+        mp_context = multiprocessing.get_context('spawn')
+        
+        with ProcessPoolExecutor(
+            max_workers=self.max_workers,
+            mp_context=mp_context,
+            initializer=_init_worker_process,
+            initargs=(converter_kwargs,)
+        ) as executor:
             # Submit all tasks
-            future_to_file = {executor.submit(self._convert_single_file, md_file): md_file for md_file in md_files}
+            future_to_file = {executor.submit(_worker_convert_file, md_file): md_file for md_file in md_files}
             
             # Process completed tasks with progress bar
             with tqdm(total=len(md_files), desc="Converting files", unit="file") as pbar:
@@ -1557,7 +1662,7 @@ class MarkdownToPDFConverter:
                             failed_count += 1
                             pbar.set_postfix_str(f"Failed: {filename}")
                     except Exception as e:
-                        self._log_error(f"Exception in parallel processing for {md_file.name}: {e}")
+                        self._log_error(f"Worker process error for {md_file.name}: {e}")
                         failed_count += 1
                         pbar.set_postfix_str(f"Failed: {md_file.name}")
                     finally:
