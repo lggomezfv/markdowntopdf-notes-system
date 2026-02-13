@@ -106,7 +106,7 @@ poetry run md2pdf --force --source ./docs
 
 - Renders Mermaid and PlantUML diagrams as images with **intelligent rendering** (dimension stability detection)
 - **Configurable diagram dimensions** with automatic resizing
-- **Per-diagram resize control** with `<!-- no-resize -->`, `<!-- upscale:X% -->`, and `<!-- downscale:X% -->` modifiers
+- **Per-diagram resize control** with `<!-- no-resize -->` and `<!-- scale:X% -->` modifiers
 - **Automatic page numbering** in PDF footer (centered)
 - **Smart verification** (skips unchanged files) with optional bypass via `--force`
 - **Parallel processing** for fast batch conversions
@@ -159,9 +159,8 @@ export MD2PDF_MAX_DIAGRAM_HEIGHT="80%"
 **How it works:**
 - Diagrams render at high resolution (default viewport: 1680x2240)
 - **Pixels**: Maximum constraint - only resize if rendered exceeds this (e.g., a 800px diagram stays 800px with `--max-diagram-width 1200`)
-- **Percentage**: Always resizes based on rendered size (e.g., `80%` of a 2000px diagram = 1600px)
+- **Percentage**: Always scales to the given percentage of rendered size (e.g., `80%` of a 2000px diagram = 1600px)
 - Aspect ratio is always preserved
-- Only downscales (never upscales, except for percentage >100%)
 - No changes required to your markdown diagram code
 
 **Per-Diagram Control:**
@@ -183,21 +182,21 @@ graph TD
 \`\`\`
 
 # This diagram is scaled to 150% (1.5x larger)
-<!-- upscale:150% -->
+<!-- scale:150% -->
 \`\`\`mermaid
 graph TD
     A --> B
 \`\`\`
 
-# This diagram is downscaled to 67% of original size
-<!-- downscale:67% -->
+# This diagram is scaled down to 67% of original size
+<!-- scale:67% -->
 \`\`\`mermaid
 graph TD
     A --> B
 \`\`\`
 
 # Works with PlantUML too
-<!-- upscale:200% -->
+<!-- scale:200% -->
 \`\`\`plantuml
 @startuml
 A -> B
@@ -207,8 +206,7 @@ A -> B
 
 **Available modifiers:**
 - `<!-- no-resize -->` - Keep original rendered size (skip all resizing)
-- `<!-- upscale:X% -->` - Scale up to X% of original (X > 100, e.g., `150%` = 1.5x larger, `200%` = 2x larger)
-- `<!-- downscale:X% -->` - Scale down to X% of original (0 < X < 100, e.g., `67%` = 67% of original, `50%` = half size)
+- `<!-- scale:X% -->` - Scale to X% of original size (e.g., `50%` = half size, `150%` = 1.5x larger, `200%` = 2x larger)
 
 ## Local PlantUML Setup (Optional)
 

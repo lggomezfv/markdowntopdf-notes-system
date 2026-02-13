@@ -667,7 +667,7 @@ class MarkdownToPDFConverter:
             A --> B
         ```
         
-        <!-- upscale:150% -->
+        <!-- scale:150% -->
         ```mermaid
         graph TD
             A --> B
@@ -677,8 +677,8 @@ class MarkdownToPDFConverter:
         
         # Pattern to match optional HTML comment modifiers on line above, followed by mermaid block
         # Handles both Unix (\n) and Windows (\r\n) line endings
-        # Captures: no-resize OR upscale:X% OR downscale:X%
-        mermaid_pattern = r'(?:<!--\s*(?:(no-resize)|upscale:(\d+)%|downscale:(\d+)%)\s*-->\s*\r?\n)?```mermaid\r?\n(.*?)\r?\n```'
+        # Captures: no-resize OR scale:X%
+        mermaid_pattern = r'(?:<!--\s*(?:(no-resize)|scale:(\d+)%)\s*-->\s*\r?\n)?```mermaid\r?\n(.*?)\r?\n```'
         
         # Find all matches with their modifiers
         matches = list(re.finditer(mermaid_pattern, content, re.DOTALL | re.IGNORECASE))
@@ -690,27 +690,19 @@ class MarkdownToPDFConverter:
         desc = f"  {filename} - Mermaid" if filename else "  Mermaid diagrams"
         for i, match in enumerate(tqdm(matches, desc=desc, unit="diagram", leave=False)):
             no_resize_modifier = match.group(1)  # "no-resize" or None
-            upscale_percent = match.group(2)  # percentage digits for upscale or None
-            downscale_percent = match.group(3)  # percentage digits for downscale or None
-            mermaid_code = match.group(4)
+            scale_percent = match.group(2)  # percentage digits or None
+            mermaid_code = match.group(3)
             full_block = match.group(0)
             
             # Determine resize behavior
             skip_resize = no_resize_modifier is not None
             custom_scale = None
-            scale_type = None
-            if upscale_percent:
-                custom_scale = f"{upscale_percent}%"
-                scale_type = "upscale"
-            elif downscale_percent:
-                # For downscale, use percentage directly (must be 0-99%)
-                # downscale:67% means scale to 67% of original size
-                percent_value = float(downscale_percent)
-                if percent_value > 0 and percent_value < 100:
-                    custom_scale = f"{downscale_percent}%"
-                    scale_type = "downscale"
+            if scale_percent:
+                percent_value = float(scale_percent)
+                if percent_value > 0:
+                    custom_scale = f"{scale_percent}%"
                 else:
-                    self._log_warning(f"Downscale percentage must be between 0-99%, got {downscale_percent}%. Ignoring modifier.")
+                    self._log_warning(f"Scale percentage must be greater than 0%, got {scale_percent}%. Ignoring modifier.")
             
             # Create unique image path using file_id to avoid race conditions
             image_path = self.temp_dir / f"mermaid_diagram_{file_id}_{i}.png"
@@ -719,8 +711,8 @@ class MarkdownToPDFConverter:
             modifier_info = ""
             if skip_resize:
                 modifier_info = " (no-resize)"
-            elif custom_scale and scale_type:
-                modifier_info = f" ({scale_type}:{custom_scale})"
+            elif custom_scale:
+                modifier_info = f" (scale:{custom_scale})"
             self._log_debug(f"Rendering Mermaid diagram {i} to: {image_path}{modifier_info}")
             
             # Reuse event loop from file processing (thread-safe)
@@ -732,8 +724,7 @@ class MarkdownToPDFConverter:
                 if skip_resize:
                     self._log_debug(f"Skipping resize for Mermaid diagram {i} due to no-resize modifier")
                 elif custom_scale:
-                    action = "upscaling" if scale_type == "upscale" else "downscaling"
-                    self._log_debug(f"Applying custom {action} {custom_scale} to Mermaid diagram {i}")
+                    self._log_debug(f"Applying custom scale {custom_scale} to Mermaid diagram {i}")
                     self._resize_image(image_path, max_width=custom_scale, max_height=custom_scale)
                 else:
                     # Use default resize settings
@@ -767,7 +758,7 @@ class MarkdownToPDFConverter:
         @enduml
         ```
         
-        <!-- upscale:150% -->
+        <!-- scale:150% -->
         ```plantuml
         @startuml
         A -> B
@@ -778,8 +769,8 @@ class MarkdownToPDFConverter:
         
         # Pattern to match optional HTML comment modifiers on line above, followed by plantuml block
         # Handles both Unix (\n) and Windows (\r\n) line endings
-        # Captures: no-resize OR upscale:X% OR downscale:X%
-        plantuml_pattern = r'(?:<!--\s*(?:(no-resize)|upscale:(\d+)%|downscale:(\d+)%)\s*-->\s*\r?\n)?```plantuml\r?\n(.*?)\r?\n```'
+        # Captures: no-resize OR scale:X%
+        plantuml_pattern = r'(?:<!--\s*(?:(no-resize)|scale:(\d+)%)\s*-->\s*\r?\n)?```plantuml\r?\n(.*?)\r?\n```'
         
         # Find all matches with their modifiers
         matches = list(re.finditer(plantuml_pattern, content, re.DOTALL | re.IGNORECASE))
@@ -791,27 +782,19 @@ class MarkdownToPDFConverter:
         desc = f"  {filename} - PlantUML" if filename else "  PlantUML diagrams"
         for i, match in enumerate(tqdm(matches, desc=desc, unit="diagram", leave=False)):
             no_resize_modifier = match.group(1)  # "no-resize" or None
-            upscale_percent = match.group(2)  # percentage digits for upscale or None
-            downscale_percent = match.group(3)  # percentage digits for downscale or None
-            plantuml_code = match.group(4)
+            scale_percent = match.group(2)  # percentage digits or None
+            plantuml_code = match.group(3)
             full_block = match.group(0)
             
             # Determine resize behavior
             skip_resize = no_resize_modifier is not None
             custom_scale = None
-            scale_type = None
-            if upscale_percent:
-                custom_scale = f"{upscale_percent}%"
-                scale_type = "upscale"
-            elif downscale_percent:
-                # For downscale, use percentage directly (must be 0-99%)
-                # downscale:67% means scale to 67% of original size
-                percent_value = float(downscale_percent)
-                if percent_value > 0 and percent_value < 100:
-                    custom_scale = f"{downscale_percent}%"
-                    scale_type = "downscale"
+            if scale_percent:
+                percent_value = float(scale_percent)
+                if percent_value > 0:
+                    custom_scale = f"{scale_percent}%"
                 else:
-                    self._log_warning(f"Downscale percentage must be between 0-99%, got {downscale_percent}%. Ignoring modifier.")
+                    self._log_warning(f"Scale percentage must be greater than 0%, got {scale_percent}%. Ignoring modifier.")
             
             # Create unique image path using file_id to avoid race conditions
             image_path = self.temp_dir / f"plantuml_diagram_{file_id}_{i}.png"
@@ -820,8 +803,8 @@ class MarkdownToPDFConverter:
             modifier_info = ""
             if skip_resize:
                 modifier_info = " (no-resize)"
-            elif custom_scale and scale_type:
-                modifier_info = f" ({scale_type}:{custom_scale})"
+            elif custom_scale:
+                modifier_info = f" (scale:{custom_scale})"
             self._log_debug(f"Rendering PlantUML diagram {i} to: {image_path}{modifier_info}")
             
             success, error_msg = self._render_plantuml_diagram(plantuml_code, image_path)
@@ -830,8 +813,7 @@ class MarkdownToPDFConverter:
                 if skip_resize:
                     self._log_debug(f"Skipping resize for PlantUML diagram {i} due to no-resize modifier")
                 elif custom_scale:
-                    action = "upscaling" if scale_type == "upscale" else "downscaling"
-                    self._log_debug(f"Applying custom {action} {custom_scale} to PlantUML diagram {i}")
+                    self._log_debug(f"Applying custom scale {custom_scale} to PlantUML diagram {i}")
                     self._resize_image(image_path, max_width=custom_scale, max_height=custom_scale)
                 else:
                     # Use default resize settings
