@@ -1383,12 +1383,16 @@ class MarkdownToPDFConverter:
             
             # Check if conversion is needed before processing (unless force_regenerate is True)
             if not self.force_regenerate:
-                current_markdown_hash = calculate_file_hash(md_file)
-                
-                if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf, self.style_profile,
-                                                            self.diagram_width, self.diagram_height, self.page_margins, True):
-                    self._log_info(f"Skipping {filename} - PDF is up to date")
-                    return "skipped", filename
+                # Fast path: if output file is missing, always regenerate
+                if not output_pdf.exists():
+                    self._log_info(f"Output pdf missing for {filename} - regenerating")
+                else:
+                    current_markdown_hash = calculate_file_hash(md_file)
+                    
+                    if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf, self.style_profile,
+                                                                self.diagram_width, self.diagram_height, self.page_margins, True):
+                        self._log_info(f"Skipping {filename} - PDF is up to date")
+                        return "skipped", filename
             
             try:
                 if self._convert_md_to_pdf(md_file, output_pdf):
