@@ -171,7 +171,7 @@ class MarkdownToPDFConverter:
             ]
         )
     
-    async def _ensure_browser(self) -> None:
+    async def _ensure_browser(self, device_scale_factor: int = 1) -> None:
         """Ensure browser instance is initialized and ready. Reuses existing browser if available."""
         tls = self._local
         
@@ -186,13 +186,13 @@ class MarkdownToPDFConverter:
             except Exception:
                 pass
         try:
-            tls.page = await tls.browser.new_page()
+            tls.page = await tls.browser.new_page(device_scale_factor=device_scale_factor)
         except Exception:
             # Browser reported connected but is actually dead — restart it
             self._log_warning("Browser connection stale, restarting...")
             await self._close_browser()
             await self._launch_browser()
-            tls.page = await tls.browser.new_page()
+            tls.page = await tls.browser.new_page(device_scale_factor=device_scale_factor)
     
     async def _close_browser(self) -> None:
         """Close browser and cleanup resources."""
@@ -348,7 +348,7 @@ class MarkdownToPDFConverter:
             return self.diagram_width
         return 1680
     
-    def _fit_diagram_to_page_width(self, image_path: Path, scale_percent: float = 100.0) -> bool:
+    def _fit_diagram_to_page_width(self, image_path: Path, scale_percent: float = 100.0, dpi_scale: int = 1) -> bool:
         """Resize a diagram image so its width equals page_width * scale_percent / 100.
         
         Unlike _resize_image (which only shrinks), this always resizes — up or down —
@@ -357,12 +357,13 @@ class MarkdownToPDFConverter:
         Args:
             image_path: Path to the rendered diagram PNG
             scale_percent: Target width as percentage of page width (100 = full width)
+            dpi_scale: DPI multiplier for high-resolution rendering (2 = Retina/2x)
             
         Returns:
             True if successful
         """
         try:
-            target_width = int(self._get_page_width_px() * scale_percent / 100.0)
+            target_width = int(self._get_page_width_px() * scale_percent / 100.0 * dpi_scale)
             
             with Image.open(image_path) as img:
                 if img.mode not in ('RGB', 'RGBA'):
@@ -566,8 +567,8 @@ class MarkdownToPDFConverter:
     async def _render_mermaid_diagram(self, mermaid_code: str, output_path: Path) -> tuple[bool, str]:
         """Render Mermaid diagram to image using Playwright."""
         try:
-            # Reuse browser instance
-            await self._ensure_browser()
+            # 2x device scale for high-DPI rasterization of vector SVGs
+            await self._ensure_browser(device_scale_factor=2)
             page = self._local.page
             
             # Set viewport for high-resolution rendering using fixed pixel dimensions
@@ -590,7 +591,7 @@ class MarkdownToPDFConverter:
                     }}
                     .mermaid {{
                         background: white;
-                        display: block;
+                        display: inline-block;
                         padding: 5px;
                     }}
                     .mermaid svg {{
@@ -922,7 +923,7 @@ class MarkdownToPDFConverter:
             if skip_resize:
                 self._log_debug(f"Skipping resize for Mermaid diagram {i} due to no-resize modifier")
             else:
-                self._fit_diagram_to_page_width(image_path, scale_percent=target_scale)
+                self._fit_diagram_to_page_width(image_path, scale_percent=target_scale, dpi_scale=2)
             
             self._log_debug(f"Mermaid diagram rendered successfully, using path: {image_path}")
             # Replace the code block with image reference
