@@ -581,7 +581,6 @@ class MarkdownToPDFConverter:
             <html>
             <head>
                 <meta charset="utf-8">
-                <script src="https://unpkg.com/mermaid@10.6.1/dist/mermaid.min.js"></script>
                 <style>
                     body {{
                         margin: 0;
@@ -590,9 +589,8 @@ class MarkdownToPDFConverter:
                         font-family: Arial, sans-serif;
                     }}
                     .mermaid {{
-                        text-align: center;
                         background: white;
-                        display: inline-block;
+                        display: block;
                         padding: 5px;
                     }}
                     .mermaid svg {{
@@ -611,13 +609,14 @@ class MarkdownToPDFConverter:
                 </style>
             </head>
             <body>
-                <div class="mermaid">
+                <pre class="mermaid">
                     {mermaid_code}
-                </div>
-                <script>
-                    // Load Mermaid configuration from file if available
-                    let mermaidConfig = {{
-                        startOnLoad: true,
+                </pre>
+                <script type="module">
+                    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+                    
+                    mermaid.initialize({{
+                        startOnLoad: false,
                         theme: 'default',
                         themeVariables: {{
                             primaryColor: '#ff6b6b',
@@ -630,11 +629,7 @@ class MarkdownToPDFConverter:
                         flowchart: {{
                             useMaxWidth: false,
                             htmlLabels: true,
-                            curve: 'basis',
-                            nodeSpacing: 30,
-                            rankSpacing: 30,
-                            diagramMarginX: 10,
-                            diagramMarginY: 5
+                            curve: 'basis'
                         }},
                         sequence: {{
                             useMaxWidth: false,
@@ -648,16 +643,11 @@ class MarkdownToPDFConverter:
                         gantt: {{
                             useMaxWidth: false
                         }},
-                        graph: {{
-                            useMaxWidth: false,
-                            nodeSpacing: 30,
-                            rankSpacing: 30,
-                            diagramMarginX: 10,
-                            diagramMarginY: 5
+                        class: {{
+                            useMaxWidth: false
                         }}
-                    }};
-                    
-                    mermaid.initialize(mermaidConfig);
+                    }});
+                    await mermaid.run();
                 </script>
             </body>
             </html>
@@ -665,7 +655,6 @@ class MarkdownToPDFConverter:
             
             await page.set_content(html_content)
             
-            # Wait for Mermaid to render - use dynamic polling instead of fixed 3s wait
             # Wait for Mermaid to render using dimension stability detection
             max_wait_time = 5000  # 5 seconds max
             poll_interval = 100  # 100ms polling
@@ -717,6 +706,27 @@ class MarkdownToPDFConverter:
                         self._log_debug(f"Mermaid diagram layout stabilized in {elapsed_time - stability_start}ms (total: {elapsed_time}ms)")
                     else:
                         self._log_warning(f"Mermaid diagram dimensions did not stabilize after {max_wait_time}ms")
+            
+            # Normalize SVGs that use width="100%" (e.g. Mermaid 11 classDiagram)
+            # to explicit pixel dimensions from the viewBox, so the browser
+            # renders them at full fidelity before we scale and rasterize.
+            await page.evaluate("""() => {
+                const svg = document.querySelector('.mermaid svg');
+                if (!svg) return;
+                const vb = svg.getAttribute('viewBox');
+                const w = svg.getAttribute('width');
+                if (vb && (!w || w.includes('%'))) {
+                    const parts = vb.split(/[\\s,]+/);
+                    const natW = parseFloat(parts[2]);
+                    const natH = parseFloat(parts[3]);
+                    if (natW > 0 && natH > 0) {
+                        svg.setAttribute('width', natW);
+                        svg.setAttribute('height', natH);
+                        svg.style.maxWidth = 'none';
+                    }
+                }
+            }""")
+            await page.wait_for_timeout(50)
             
             # Scale the SVG up to the target page width BEFORE rasterizing.
             # SVGs are vector graphics, so this produces a perfectly crisp image
