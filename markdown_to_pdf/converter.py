@@ -317,7 +317,7 @@ class MarkdownToPDFConverter:
         
         The viewport is set larger than the target output dimensions so diagrams
         render at their natural size with full detail.  The final image size is
-        then determined by _fit_diagram_to_page_width and scale annotations.
+        then determined by _fit_diagram_to_page and scale annotations.
         
         Returns:
             Tuple of (width, height) in pixels for viewport size
@@ -348,11 +348,29 @@ class MarkdownToPDFConverter:
             return self.diagram_width
         return 1680
     
-    def _fit_diagram_to_page_width(self, image_path: Path, scale_percent: float = 100.0, dpi_scale: int = 1) -> bool:
-        """Resize a diagram image so its width equals page_width * scale_percent / 100.
+    def _get_page_content_height_px(self) -> int:
+        """Get the A4 content area height in pixels, in the same coordinate
+        system as _get_page_width_px().  Accounts for configured margins."""
+        margins = self._parse_margins()
+        top_cm = self._convert_margin_to_cm(margins['top'])
+        bottom_cm = self._convert_margin_to_cm(margins['bottom'])
+        left_cm = self._convert_margin_to_cm(margins['left'])
+        right_cm = self._convert_margin_to_cm(margins['right'])
+        content_width_cm = 21.0 - left_cm - right_cm
+        content_height_cm = 29.7 - top_cm - bottom_cm
+        page_width_px = self._get_page_width_px()
+        return int(page_width_px * content_height_cm / content_width_cm)
+    
+    def _fit_diagram_to_page(self, image_path: Path, scale_percent: float = 100.0, dpi_scale: int = 1) -> bool:
+        """Resize a diagram image to fit within a single A4 page.
         
-        Unlike _resize_image (which only shrinks), this always resizes — up or down —
-        so the diagram fills the intended portion of the page width.
+        The image is scaled so that its width equals page_width * scale_percent / 100.
+        If the resulting height exceeds the A4 content area, the image is scaled down
+        further so the height fits — the more constraining dimension wins.
+        
+        The CSS max-height in the HTML template provides the visual constraint at
+        render time; the PNG-level cap here keeps file sizes reasonable so Chromium's
+        PDF renderer can handle the embedded base64 images.
         
         Args:
             image_path: Path to the rendered diagram PNG
@@ -364,6 +382,7 @@ class MarkdownToPDFConverter:
         """
         try:
             target_width = int(self._get_page_width_px() * scale_percent / 100.0 * dpi_scale)
+            max_height = int(self._get_page_content_height_px() * dpi_scale)
             
             with Image.open(image_path) as img:
                 if img.mode not in ('RGB', 'RGBA'):
@@ -374,18 +393,27 @@ class MarkdownToPDFConverter:
                 
                 orig_width, orig_height = img.size
                 
-                if orig_width == target_width:
-                    self._log_debug(f"Diagram already at target width {target_width}px")
-                    return True
+                width_scale = target_width / orig_width
+                height_after_width_fit = int(orig_height * width_scale)
                 
-                scale_factor = target_width / orig_width
-                new_width = target_width
-                new_height = int(orig_height * scale_factor)
+                if height_after_width_fit <= max_height:
+                    scale_factor = width_scale
+                    new_width = target_width
+                    new_height = height_after_width_fit
+                    constraint = f"{scale_percent}% of page width"
+                else:
+                    scale_factor = max_height / orig_height
+                    new_width = int(orig_width * scale_factor)
+                    new_height = max_height
+                    constraint = "capped to page height"
+                
+                if orig_width == new_width and orig_height == new_height:
+                    self._log_debug(f"Diagram already at target size {new_width}x{new_height}px")
+                    return True
                 
                 is_upscaling = scale_factor > 1.0
                 resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
                 
-                # Apply sharpening
                 if is_upscaling:
                     sharpened = resized.filter(ImageFilter.UnsharpMask(radius=1.0, percent=200, threshold=2))
                 else:
@@ -399,11 +427,11 @@ class MarkdownToPDFConverter:
                     sharpened.save(image_path, optimize=False)
                 
                 direction = "upscaled" if is_upscaling else "downscaled"
-                self._log_debug(f"Fit diagram to page: {orig_width}x{orig_height} -> {new_width}x{new_height} ({direction}, {scale_percent}% of page width)")
+                self._log_debug(f"Fit diagram to page: {orig_width}x{orig_height} -> {new_width}x{new_height} ({direction}, {constraint})")
             
             return True
         except Exception as e:
-            self._log_warning(f"Failed to fit diagram to page width: {e}")
+            self._log_warning(f"Failed to fit diagram to page: {e}")
             return False
     
     def _parse_dimension_value(self, value, original_size: int) -> Optional[int]:
@@ -923,14 +951,14 @@ class MarkdownToPDFConverter:
             if skip_resize:
                 self._log_debug(f"Skipping resize for Mermaid diagram {i} due to no-resize modifier")
             else:
-                self._fit_diagram_to_page_width(image_path, scale_percent=target_scale, dpi_scale=2)
+                self._fit_diagram_to_page(image_path, scale_percent=target_scale, dpi_scale=2)
             
             self._log_debug(f"Mermaid diagram rendered successfully, using path: {image_path}")
-            # Replace the code block with image reference
-            content = content.replace(
-                full_block,
-                f"![]({image_path})"
-            )
+            if target_scale != 100.0 and not skip_resize:
+                img_tag = f'<img src="{image_path}" style="max-width:{target_scale}%" />'
+            else:
+                img_tag = f"![]({image_path})"
+            content = content.replace(full_block, img_tag)
         
         return content
     
@@ -1002,14 +1030,14 @@ class MarkdownToPDFConverter:
             if skip_resize:
                 self._log_debug(f"Skipping resize for PlantUML diagram {i} due to no-resize modifier")
             else:
-                self._fit_diagram_to_page_width(image_path, scale_percent=target_scale)
+                self._fit_diagram_to_page(image_path, scale_percent=target_scale)
             
             self._log_debug(f"PlantUML diagram rendered successfully, using path: {image_path}")
-            # Replace the code block with image reference
-            content = content.replace(
-                full_block,
-                f"![]({image_path})"
-            )
+            if target_scale != 100.0 and not skip_resize:
+                img_tag = f'<img src="{image_path}" style="max-width:{target_scale}%" />'
+            else:
+                img_tag = f"![]({image_path})"
+            content = content.replace(full_block, img_tag)
         
         return content
     
@@ -1219,6 +1247,9 @@ class MarkdownToPDFConverter:
         bottom_cm = self._convert_margin_to_cm(margins['bottom'])
         left_cm = self._convert_margin_to_cm(margins['left'])
         
+        # Max image height: 80% of content area to leave room for headings/text
+        img_max_height_cm = 29.7 - top_cm - bottom_cm
+        
         html_template = f"""
 <!DOCTYPE html>
 <html>
@@ -1387,9 +1418,12 @@ class MarkdownToPDFConverter:
         
         img {{
             max-width: 100%;
+            max-height: {img_max_height_cm:.2f}cm;
+            width: auto;
             height: auto;
             display: block;
             margin: 0.5em auto;
+            object-fit: contain;
         }}
         
         /* Specific styling for Mermaid diagram images */
@@ -1718,6 +1752,13 @@ class MarkdownToPDFConverter:
                 
                 with open(html_file, 'r', encoding='utf-8') as f:
                     html_content = f.read()
+                
+                # Strip pandoc's HTML wrapper so we only inject <body> content
+                # into our own template (avoids invalid nested <html> documents)
+                import re as _re
+                body_match = _re.search(r'<body[^>]*>(.*)</body>', html_content, _re.DOTALL | _re.IGNORECASE)
+                if body_match:
+                    html_content = body_match.group(1)
                 
                 margins = self._parse_margins()
                 enhanced_html = self._create_html_template(html_content, margins, doc_title)
